@@ -1,26 +1,131 @@
 
-      - name: Extract Android project
+name: Build WiPwn APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare Android SDK
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
-          echo "Repository files:"
-          ls -la
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" \
+            -type f -name sdkmanager 2>/dev/null | head -n 1 || true)"
 
-          echo "Checking source ZIP:"
-          test -f wipwn-no-root-source.zip
-          unzip -l wipwn-no-root-source.zip | head -n 80
-
-          mkdir -p source
-          unzip -o wipwn-no-root-source.zip -d source
-
-          echo "Extracted files:"
-          find source -maxdepth 6 -type f | head -n 200
-
-          echo "Searching for Gradle wrapper:"
-          find source -type f \( -name gradlew -o -name gradlew.bat \) -print
-
-          if ! find source -type f -name gradlew -print -quit | grep -q .; then
-            echo "ERROR: ZIP does not contain gradlew, or the wrong ZIP was uploaded."
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERROR: Android SDK sdkmanager not found"
             exit 1
           fi
+
+          yes | "$SDKMANAGER" --licenses || true
+
+          "$SDKMANAGER" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;28.0.13004108"
+
+      - name: Inspect and extract Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Repository root:"
+          pwd
+          ls -la
+
+          ZIP_FILE="wipwn-no-root-source.zip"
+
+          if [ ! -f "$ZIP_FILE" ]; then
+            echo "ERROR: $ZIP_FILE was not found in repository root"
+            exit 1
+          fi
+
+          echo "ZIP contents:"
+          unzip -l "$ZIP_FILE" | head -n 100
+
+          mkdir -p source
+          unzip -o "$ZIP_FILE" -d source
+
+          echo "Searching for Gradle wrapper:"
+          find source -type f -name gradlew -print
+
+          WRAPPER="$(find source -type f -name gradlew -print -quit)"
+
+          if [ -z "$WRAPPER" ]; then
+            echo "ERROR: gradlew is missing from the ZIP."
+            echo "The ZIP must contain the complete Android project."
+            exit 1
+          fi
+
+          echo "Gradle wrapper found at: $WRAPPER"
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WRAPPER="$(find source -type f -name gradlew -print -quit)"
+
+          if [ -z "$WRAPPER" ]; then
+            echo "ERROR: gradlew was not found"
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$WRAPPER")"
+          cd "$PROJECT_DIR"
+
+          chmod +x gradlew
+
+          if [ ! -f settings.gradle ] && \
+             [ ! -f settings.gradle.kts ]; then
+            echo "ERROR: Gradle settings file not found in $PROJECT_DIR"
+            find . -maxdepth 3 -type f | head -n 100
+            exit 1
+          fi
+
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Locate APK
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find source -type f -name '*.apk' -print
+
+          if ! find source -type f \
+            -path '*/build/outputs/apk/debug/*.apk' \
+            -print -quit | grep -q .; then
+            echo "ERROR: Debug APK was not generated"
+            exit 1
+          fi
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wipwn-debug-apk
+          path: source/**/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 7
+          
